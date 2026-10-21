@@ -116,12 +116,337 @@
 4. Система проверяет допустимость перехода, сохраняет новый статус заказа и публикует соответствующее событие.
 5. При повторной доставке одного и того же события система может повторно получить и проверить его, но не должна повторно применять его эффект. Состояние заказа не должно изменяться повторно из-за одного и того же события. Это обеспечивается идемпотентностью обработки событий.
 ---
-##  Архитектура системы
+## Архитектура системы
 
+Основные компоненты:
+
+1. API Gateway — входная точка в систему, отвечает за маршрутизацию клиентских запросов, проверку токена и валидацию запросов
+2. User Service — регистрация, аутентификация и роли пользователей (пользователь / администратор); выдаёт токены доступа
+3. Catalog Service — каталог товаров: поиск, фильтрация, карточки, управление товарами администратором; stateless, масштабируется горизонтально
+4. Order Service — корзина, оформление заказа, резервирование и учёт остатков, статусы заказов; stateless, масштабируется горизонтально. Заказы, остатки и резервы хранятся в одной БД, поэтому создание заказа и изменение остатков выполняются одной локальной транзакцией
+5. Payment Mock — имитация онлайн-оплаты; результат публикуется событием в брокер
+6. Notification Service — уведомления пользователя об изменении статуса заказа; потребляет события с дедупликацией по eventId
+7. Message Broker — брокер сообщений, обеспечивающий асинхронную передачу событий между сервисами; события публикуются через transactional outbox
+8. Catalog DB, Users DB, Orders & Stock DB — реляционные БД (PostgreSQL); каждая — single-master с репликой и автоматическим переключением на реплику при отказе мастера (failover)
+9. Cart Store (Redis) — хранилище корзин пользователей с репликой
+
+```mermaid
+graph TD
+  subgraph Gateway
+    APIGateway[API Gateway]
+  end
+  subgraph Services
+    UserSvc[User Service]
+    Catalog[Catalog Service — N инстансов]
+    Order[Order Service — N инстансов]
+    Payment[Payment Mock]
+    Notify[Notification Service]
+    Broker[Message Broker]
+  end
+  subgraph Databases
+    UsersDB[(Users DB — master + реплика)]
+    CatalogDB[(Catalog DB — master + реплика)]
+    OrdersDB[(Orders & Stock DB — master + реплика)]
+    Cart[(Cart Store — Redis)]
+  end
+
+  APIGateway-->|gRPC|UserSvc
+  APIGateway-->|gRPC|Catalog
+  APIGateway-->|gRPC|Order
+  UserSvc-->|SQL|UsersDB
+  Catalog-->|SQL|CatalogDB
+  Catalog-->|gRPC, запрос остатков|Order
+  Order-->|SQL: заказ + резерв товара на складе + outbox|OrdersDB
+  Order-->|корзина|Cart
+  Order-->|gRPC, инициация оплаты|Payment
+  Order-->|события из outbox,<br/>at-least-once|Broker
+  Payment-->|payment.completed / failed|Broker
+  Broker-->|payment.completed / failed|Order
+  Broker-->|события|Notify
+```
+
+### Согласованное оформление заказа и защита от продажи сверх остатка
+
+- **Проблема:** параллельные заказы могут одновременно забрать последние единицы товара; сбой между созданием заказа и изменением остатков оставляет данные несогласованными.
+- **Решение:** остатки, резервы и заказы хранятся в одной БД. Резервирование выполняется атомарным условным обновлением `UPDATE stock SET available = available - :n WHERE sku = :sku AND available >= :n`; если затронуто 0 строк, товара недостаточно. Резерв записывается в таблицу `reservations` с полем `expires_at` (15 минут). Создание заказа и закрепление резерва за ним выполняются одной транзакцией. Фоновая задача освобождает просроченные резервы, возвращая количество в остаток.
+- **Гарантия:** остаток не становится отрицательным; одна единица не закрепляется за двумя заказами; заказ не создаётся без товара, и товар не закрепляется за несуществующим заказом.
+- **Компромиссы:** единая БД для заказов и остатков упрощает согласованность, но ограничивает независимое масштабирование склада; конкурирующие запросы на одну позицию сериализуются блокировкой строки.
+
+### Масштабирование и отказоустойчивость БД
+
+- **Проблема:** нагрузка на чтение каталога и заказов растёт; мастер БД может отказать.
+- **Решение:** внутренние вызовы между сервисами (от API Gateway и между микросервисами) выполняются по gRPC; наружу API Gateway предоставляет REST/HTTP. Catalog Service и Order Service не хранят состояние (кроме БД и Redis), поэтому за API Gateway запускается несколько инстансов с балансировкой нагрузки. Чтение каталога и истории заказов направляется на реплики. Недоступность мастера определяется по таймауту запроса и health-проверкам; реплика продвигается в мастера, старый мастер изолируется (fencing) для защиты от split-brain.
+- **Гарантия:** при отказе мастера сохраняются просмотр каталога, работа с корзиной (Redis) и просмотр заказов (с реплики); после переключения оформление заказа возобновляется без нарушения согласованности.
+- **Компромиссы:** на время переключения оформление заказа недоступно; чтение с реплики может отдавать слегка устаревшие данные (replication lag).
+
+### Доставка событий и идемпотентность
+
+- **Проблема:** брокер может терять сообщения и доставлять их повторно; результат оплаты может прийти дважды.
+- **Решение:** событие об изменении статуса записывается в outbox-таблицу в той же транзакции, что и смена статуса, и пересылается в брокер с повторами до подтверждения (at-least-once). Потребители (Order Service, Notification Service) хранят идентификаторы обработанных событий (`eventId`) в таблице `processed_events`; проверка и применение эффекта выполняются в одной транзакции. Смена статуса также проверяется по таблице допустимых переходов.
+- **Гарантия:** событие не теряется при отказе брокера; повторная доставка не приводит к повторному применению эффекта (например, повторному освобождению резерва).
+- **Компромиссы:** выбрана семантика at-least-once вместо at-most-once: потеря события хуже дубликата, а дубли устраняются дедупликацией; уведомления могут приходить с задержкой.
+
+### Обработка частичных отказов
+
+- **Проблема:** сервис или узел может отказать «молча» — важно отличать медленный узел от отказавшего.
+- **Решение:** таймауты на межсервисные вызовы, health-проверки, повтор запроса (retry) с идемпотентным ключом, failover мастера БД. Недоступность Payment Mock приводит к отмене заказа и освобождению резерва либо к повтору запроса оплаты.
+- **Гарантия:** при отказе одного инстанса сервиса или реплики запросы продолжают обслуживаться остальными.
+- **Компромиссы:** короткий таймаут порождает ложные срабатывания, длинный — замедляет реакцию; повторы требуют идемпотентности операций.
+
+---
 
 ## Технические сценарии
 
+### Сценарий: просмотр и поиск товаров
+
+1. Клиент отправляет в API Gateway запрос GET /products с параметрами `q`, `category`, `minPrice`, `maxPrice`, `limit`, `offset`.
+2. API Gateway перенаправляет запрос в один из инстансов Catalog Service.
+3. Catalog Service читает товары из реплики Catalog DB и запрашивает у Order Service доступные остатки.
+4. Клиент получает список товаров; карточка открывается запросом GET /products/{sku}.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Catalog
+  participant CatalogDB
+  participant Order
+
+  Client->>APIGateway: GET /products?q=молоко&category=...
+  APIGateway->>Catalog: Поиск товаров
+  Catalog->>CatalogDB: SELECT ... FROM products WHERE ... (реплика)
+  CatalogDB-->>Catalog: Список товаров
+  Catalog->>Order: Остатки по sku
+  Order-->>Catalog: Доступное количество
+  Catalog-->>APIGateway: Товары с ценами и доступностью
+  APIGateway-->>Client: 200 OK
+```
+
+### Сценарий: управление корзиной
+
+1. Клиент отправляет POST /cart/items (sku, quantity) или PATCH/DELETE /cart/items/{sku}.
+2. API Gateway проверяет токен и передаёт запрос в Order Service.
+3. Order Service проверяет доступность товара и сохраняет позицию в Cart Store.
+4. Клиент запрашивает GET /cart; Order Service возвращает позиции и итоговую стоимость.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Order
+  participant Cart as Cart Store
+
+  Client->>APIGateway: POST /cart/items (sku, quantity)
+  APIGateway->>Order: Добавить позицию (userId из токена)
+  Order->>Order: Проверить доступность sku
+  Order->>Cart: Сохранить позицию
+  Cart-->>Order: OK
+  Order-->>APIGateway: Корзина обновлена
+  APIGateway-->>Client: 200 OK (корзина, итог)
+```
+
+### Сценарий: оформление заказа (успешная оплата)
+
+1. Клиент отправляет POST /orders с идемпотентным ключом `Idempotency-Key`.
+2. Order Service в одной транзакции атомарно уменьшает остатки по позициям корзины, создаёт резервы на 15 минут, создаёт заказ со статусом «Ожидает оплаты» и пишет событие в outbox.
+3. Order Service инициирует оплату в Payment Mock и возвращает клиенту заказ.
+4. Payment Mock публикует `payment.completed` в Message Broker.
+5. Order Service получает событие, проверяет `eventId` в `processed_events`, переводит заказ в «Оплачен», фиксирует резерв как проданный товар, очищает корзину и пишет событие в outbox.
+6. Notification Service получает событие об изменении статуса и уведомляет пользователя.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Order
+  participant OrdersDB
+  participant Payment
+  participant Broker as Message Broker
+  participant Notify as Notification
+
+  Client->>APIGateway: POST /orders (Idempotency-Key)
+  APIGateway->>Order: Оформить заказ
+  Order->>OrdersDB: Одна транзакция: списать остаток, резерв (15 мин), заказ «Ожидает оплаты», outbox
+  OrdersDB-->>Order: OK
+  Order->>Payment: Инициировать оплату
+  Order-->>APIGateway: Заказ создан
+  APIGateway-->>Client: 201 Created (Ожидает оплаты)
+  Payment->>Broker: payment.completed (eventId)
+  Broker->>Order: Доставка события
+  Order->>OrdersDB: Проверка eventId, статус «Оплачен», резерв → продан, outbox
+  Order->>Broker: order.status.changed (из outbox)
+  Broker->>Notify: Доставка события
+  Notify->>Notify: Дедупликация по eventId
+```
+
+### Сценарий: неуспешная оплата, истечение резерва и нехватка товара
+
+1. Неуспешная оплата: Payment Mock публикует `payment.failed`; Order Service в одной транзакции переводит заказ в «Отменён», возвращает остатки из резерва и пишет событие в outbox; пользователь получает уведомление.
+2. Истечение резерва: фоновая задача Order Service находит резервы с `expires_at < now()`, в транзакции освобождает их, а связанный заказ (если создан) переводит в «Отменён».
+3. Нехватка товара: условное обновление остатка затрагивает 0 строк, транзакция откатывается, заказ не создаётся, клиент получает 409 Conflict.
+
+```mermaid
+sequenceDiagram
+  participant Payment
+  participant Broker as Message Broker
+  participant Order
+  participant OrdersDB
+  participant Client
+
+  Payment->>Broker: payment.failed (eventId)
+  Broker->>Order: Доставка события
+  Order->>OrdersDB: Одна транзакция: «Отменён», вернуть остаток, outbox
+  Note over Order,OrdersDB: Фоновая задача по expires_at делает то же для просроченных резервов
+  Client->>Order: POST /orders (товара не хватает)
+  Order->>OrdersDB: UPDATE stock ... WHERE available >= n (0 строк)
+  OrdersDB-->>Order: Откат транзакции
+  Order-->>Client: 409 Conflict, заказ не создан
+```
+
+### Сценарий: просмотр истории и информации о заказах
+
+1. Клиент отправляет GET /orders, затем GET /orders/{orderId}.
+2. API Gateway перенаправляет запрос в Order Service.
+3. Order Service читает заказы пользователя из реплики Orders & Stock DB и возвращает состав, суммы и статусы.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGateway
+  participant Order
+  participant OrdersDB
+
+  Client->>APIGateway: GET /orders
+  APIGateway->>Order: История заказов (userId)
+  Order->>OrdersDB: SELECT ... FROM orders WHERE user_id=... (реплика)
+  OrdersDB-->>Order: Заказы
+  Order-->>APIGateway: Список заказов
+  APIGateway-->>Client: 200 OK
+```
+
+### Сценарий: управление товарами и остатками администратором
+
+1. Администратор получает токен через User Service; API Gateway проверяет роль.
+2. Администратор отправляет POST /admin/products (название, категория, цена, начальный остаток) либо PUT /admin/products/{sku}, PUT /admin/stock/{sku}.
+3. Catalog Service сохраняет данные товара в Catalog DB; Order Service обновляет остаток в Orders & Stock DB.
+
+```mermaid
+sequenceDiagram
+  participant Admin
+  participant APIGateway
+  participant Catalog
+  participant CatalogDB
+  participant Order
+  participant OrdersDB
+
+  Admin->>APIGateway: POST /admin/products (токен admin)
+  APIGateway->>Catalog: Создать товар
+  Catalog->>CatalogDB: INSERT product
+  Catalog->>Order: Задать начальный остаток (sku, qty)
+  Order->>OrdersDB: INSERT/UPDATE stock
+  Order-->>Catalog: OK
+  Catalog-->>APIGateway: Товар создан
+  APIGateway-->>Admin: 201 Created
+```
+
+### Сценарий: изменение статуса заказа администратором и повторная доставка события
+
+1. Администратор отправляет PATCH /admin/orders/{orderId}/status с новым статусом.
+2. Order Service проверяет допустимость перехода, в одной транзакции сохраняет статус и пишет событие в outbox.
+3. Отправитель outbox публикует событие в брокер; если брокер недоступен, отправка повторяется до подтверждения (at-least-once).
+4. Брокер может доставить событие потребителю дважды; потребитель находит `eventId` в `processed_events` и отбрасывает дубликат, состояние не меняется повторно.
+
+```mermaid
+sequenceDiagram
+  participant Admin
+  participant Order
+  participant OrdersDB
+  participant Outbox
+  participant Broker as Message Broker
+  participant Notify as Notification
+
+  Admin->>Order: PATCH /admin/orders/{id}/status
+  Order->>OrdersDB: Проверка перехода + статус + outbox (одна транзакция)
+  Order-->>Admin: 200 OK
+  Outbox->>Broker: Отправка события
+  Broker--xOutbox: Недоступен
+  Outbox->>Broker: Повтор
+  Broker-->>Outbox: Подтверждение
+  Broker->>Notify: Доставка события (возможен дубль)
+  Notify->>Notify: eventId уже обработан — дубль отброшен
+```
+
+### Сценарий: отказ мастера БД
+
+1. Во время оформления заказа мастер Orders & Stock DB перестаёт отвечать.
+2. Order Service не получает ответ в течение таймаута и проверяет узел health-запросом; мастер недоступен.
+3. Реплика продвигается в мастера, старый мастер изолируется (fencing).
+4. Каталог, корзина и просмотр заказов продолжают работать; оформление заказа временно возвращает 503.
+5. После переключения Order Service повторяет операцию (клиентский повтор безопасен благодаря `Idempotency-Key`); данные остаются согласованными.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant Order
+  participant Master
+  participant Replica
+
+  Client->>Order: POST /orders
+  Order->>Master: Транзакция заказа
+  Master--xOrder: Таймаут
+  Order->>Master: Health-проверка
+  Master--xOrder: Недоступен
+  Order-->>Client: 503 (временно)
+  Note over Replica: Продвижение в мастера + fencing старого
+  Client->>Order: Повтор POST /orders (тот же Idempotency-Key)
+  Order->>Replica: Транзакция заказа
+  Replica-->>Order: OK
+  Order-->>Client: 201 Created
+```
+
+---
 
 ## План разработки и тестирования
 
+**Включает:**
+- Каталог с поиском и фильтрацией, управление товарами и остатками администратором
+- Корзина, оформление заказа с резервированием на 15 минут, имитация оплаты
+- История заказов, управление статусами заказов
+- Message Broker, transactional outbox, идемпотентная обработка событий
+- Настройка репликации БД и failover, горизонтальное масштабирование Catalog и Order Service
 
+**План разработки:**
+1. Проектирование API и схем БД (товары, пользователи, заказы, остатки, резервы, outbox, processed_events)
+2. Реализация User Service и проверки токена/ролей в API Gateway
+3. Реализация Catalog Service (поиск, фильтры, управление товарами)
+4. Реализация Order Service: корзина, атомарное резервирование, создание заказа, статусы и допустимые переходы
+5. Реализация фоновой задачи освобождения просроченных резервов
+6. Реализация Payment Mock
+7. Интеграция с Message Broker, transactional outbox, дедупликация потребителей по eventId
+8. Реализация Notification Service
+9. Настройка репликации PostgreSQL и failover
+10. Контейнеризация (docker-compose), запуск нескольких инстансов Catalog и Order Service за балансировщиком
+11. Документирование API
+
+**План тестирования:**
+- Модульные тесты: допустимые переходы статусов, расчёт стоимости, логика резервирования
+- Интеграционные тесты сервисов с БД и брокером
+- Тесты API Gateway (валидные/невалидные запросы, права доступа)
+- Тест параллельного оформления: N одновременных заказов на последние единицы товара — остаток не уходит в минус, лишние заказы получают отказ
+- Тест атомарности: сбой в середине транзакции не оставляет заказ без резерва и резерв без заказа
+- Тест истечения резерва: через 15 минут резерв освобождается, заказ отменяется
+- Тест идемпотентности: повторный POST /orders с тем же ключом не создаёт второй заказ
+- Тест дедупликации событий: повторная доставка не меняет состояние заказа повторно
+- Тест доставки событий при недоступности брокера (outbox, повторы)
+- Тест failover: остановка мастера БД — каталог, корзина и заказы доступны, оформление восстанавливается после переключения
+- Тест масштабирования: работа при нескольких инстансах Catalog и Order Service
+- Проверка граничных случаев (пустая корзина, несуществующий товар, нулевое количество)
+
+**Definition of Done (DoD):**
+- Просмотр, поиск и фильтрация каталога работают
+- Пользователь оформляет заказ, оплата проходит в имитационном режиме, статус становится «Оплачен»
+- При неуспешной оплате и истечении резерва заказ отменяется, товар возвращается в остаток
+- При параллельном оформлении остаток не уходит в минус
+- Повторная доставка события не меняет состояние заказа повторно
+- Оформление заказа возобновляется после отказа мастера БД (failover)
+- Запущено несколько инстансов Catalog и Order Service, система работает корректно
