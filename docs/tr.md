@@ -375,10 +375,7 @@ sequenceDiagram
 
   Client->>APIGateway: POST /orders (Idempotency-Key)
   APIGateway->>Order: Оформить заказ
-  Order->>OrdersDB: Одна транзакция: ключ, сохранение order_items,
-остаток −n, резерв ACTIVE (15 мин),
-заказ «Ожидает оплаты», удаление оформленных позиций
-из корзины, outbox (payment.requested)
+  Order->>OrdersDB: Одна транзакция: ключ, order_items, остаток -n, резерв ACTIVE (15 мин), заказ «Ожидает оплаты», удаление оформленных позиций из корзины, outbox (payment.requested)
   OrdersDB-->>Order: OK
   Order-->>APIGateway: Заказ создан
   APIGateway-->>Client: 201 Created (Ожидает оплаты)
@@ -387,8 +384,7 @@ sequenceDiagram
   Payment->>PaymentsDB: Платёж (paymentId=orderId) + результат + outbox
   Payment->>Broker: payment.completed (из outbox)
   Broker->>Order: Доставка события
-  Order->>OrdersDB: Одна транзакция: eventId, заказ → «Оплачен»,
-резерв ACTIVE → CONSUMED, уведомление, outbox
+  Order->>OrdersDB: Одна транзакция: eventId, заказ «Оплачен», резерв ACTIVE -> CONSUMED, уведомление, outbox
   Order->>Broker: order.status.changed (из outbox)
   Client->>APIGateway: GET /notifications
   APIGateway->>Order: Получить уведомления
