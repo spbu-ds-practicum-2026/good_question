@@ -56,7 +56,7 @@ class CatalogClient:
 
     def price(self, sku: str) -> Price:
         try:
-            response = self.client.get(f"/products/{quote(sku, safe='')}/price")
+            response = self.client.get(f"/internal/products/{quote(sku, safe='')}/price")
         except httpx.TimeoutException as exc:
             raise DomainError(504, "catalog_timeout", "Catalog Service не ответил вовремя") from exc
         except httpx.RequestError as exc:

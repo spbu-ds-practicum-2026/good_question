@@ -133,7 +133,7 @@ def create_app(
             session.commit()
         else:
             # A previous attempt may have timed out after Order Service committed the stock.
-            # Reuse the same deterministic idempotency key; never create a fresh operation key.
+            # Repeating the same PUT for this SKU preserves the stock originally set.
             if (product.name, product.category, product.price, product.currency) != (
                 payload.name, payload.category, payload.price, payload.currency
             ):

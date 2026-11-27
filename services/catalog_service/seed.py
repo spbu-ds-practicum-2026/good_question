@@ -1,3 +1,6 @@
+import argparse
+
+from catalog_service.clients.order_client import OrderStockClient
 from catalog_service.config import settings
 from catalog_service.database import Base, make_sessions
 from catalog_service.models import Product
@@ -12,6 +15,14 @@ DEMO_PRODUCTS = [
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Seed the demo catalog")
+    parser.add_argument("--with-stock", action="store_true", help="Initialize stock in Order Service")
+    args = parser.parse_args()
+    if args.with_stock:
+        client = OrderStockClient(settings)
+        for sku, _, _, _ in DEMO_PRODUCTS:
+            client.set_initial_stock(sku, 25)
+
     sessions, engine = make_sessions(settings.catalog_database_url)
     Base.metadata.create_all(engine)
     with sessions.begin() as session:

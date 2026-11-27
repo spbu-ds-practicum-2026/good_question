@@ -1,0 +1,201 @@
+x-postgres: &postgres
+  image: postgres:16-alpine
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+    interval: 2s
+    timeout: 3s
+    retries: 20
+    start_period: 5s
+
+x-order-image: &order-image
+  image: ${COMPOSE_PROJECT_NAME:-good_question}-order-payment:demo
+  build: ./services/order-payment
+
+x-orders-env: &orders-env
+  ORDERS_DATABASE_URL: postgresql+psycopg://demo:demo@orders-db:5432/orders
+  CATALOG_URL: http://catalog:8001
+  RABBITMQ_URL: amqp://demo:demo@rabbitmq:5672/%2F
+
+x-payments-env: &payments-env
+  PAYMENTS_DATABASE_URL: postgresql+psycopg://demo:demo@payments-db:5432/payments
+  RABBITMQ_URL: amqp://demo:demo@rabbitmq:5672/%2F
+
+x-catalog-image: &catalog-image
+  image: ${COMPOSE_PROJECT_NAME:-good_question}-catalog:demo
+  build: ./services/catalog_service
+  environment:
+    CATALOG_DATABASE_URL: postgresql+psycopg://demo:demo@catalog-db:5432/catalog
+    ORDER_SERVICE_URL: http://order-api:8002
+
+x-http-health: &http-health
+  interval: 2s
+  timeout: 3s
+  retries: 25
+  start_period: 5s
+
+x-order-worker: &order-worker
+  <<: *order-image
+  restart: unless-stopped
+  environment: *orders-env
+  depends_on:
+    orders-migrate: {condition: service_completed_successfully}
+    broker-init: {condition: service_completed_successfully}
+
+x-payment-worker: &payment-worker
+  <<: *order-image
+  restart: unless-stopped
+  environment: *payments-env
+  depends_on:
+    payments-migrate: {condition: service_completed_successfully}
+    broker-init: {condition: service_completed_successfully}
+
+services:
+  catalog-db:
+    <<: *postgres
+    environment: {POSTGRES_USER: demo, POSTGRES_PASSWORD: demo, POSTGRES_DB: catalog}
+    volumes: [catalog-data:/var/lib/postgresql/data]
+
+  orders-db:
+    <<: *postgres
+    environment: {POSTGRES_USER: demo, POSTGRES_PASSWORD: demo, POSTGRES_DB: orders}
+    volumes: [orders-data:/var/lib/postgresql/data]
+
+  payments-db:
+    <<: *postgres
+    environment: {POSTGRES_USER: demo, POSTGRES_PASSWORD: demo, POSTGRES_DB: payments}
+    volumes: [payments-data:/var/lib/postgresql/data]
+
+  rabbitmq:
+    image: rabbitmq:4.1-alpine
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment: {RABBITMQ_DEFAULT_USER: demo, RABBITMQ_DEFAULT_PASS: demo}
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      timeout: 8s
+      retries: 20
+      start_period: 10s
+
+  broker-init:
+    <<: *order-image
+    command: ["python", "broker_topology.py"]
+    environment:
+      RABBITMQ_URL: amqp://demo:demo@rabbitmq:5672/%2F
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+
+  orders-migrate:
+    <<: *order-image
+    command: ["python", "-m", "order_payment.cli", "migrate", "orders"]
+    environment: *orders-env
+    depends_on:
+      orders-db: {condition: service_healthy}
+
+  payments-migrate:
+    <<: *order-image
+    command: ["python", "-m", "order_payment.cli", "migrate", "payments"]
+    environment: *payments-env
+    depends_on:
+      payments-db: {condition: service_healthy}
+
+  catalog:
+    <<: *catalog-image
+    restart: unless-stopped
+    depends_on:
+      catalog-db: {condition: service_healthy}
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8001/health/ready', timeout=2)"]
+
+  order-api:
+    <<: *order-image
+    restart: unless-stopped
+    command: ["uvicorn", "order_payment.orders.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8002"]
+    environment: *orders-env
+    depends_on:
+      orders-migrate: {condition: service_completed_successfully}
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8002/health/ready', timeout=2)"]
+
+  payment-mock:
+    <<: *order-image
+    restart: unless-stopped
+    command: ["uvicorn", "order_payment.payments:create_app", "--factory", "--host", "0.0.0.0", "--port", "8003"]
+    environment: *payments-env
+    depends_on:
+      payments-migrate: {condition: service_completed_successfully}
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8003/health/ready', timeout=2)"]
+
+  orders-relay:
+    <<: *order-worker
+    command: ["python", "-m", "order_payment.cli", "worker", "orders", "relay"]
+
+  orders-consumer:
+    <<: *order-worker
+    command: ["python", "-m", "order_payment.cli", "worker", "orders", "consume"]
+
+  orders-expire:
+    <<: *order-image
+    restart: unless-stopped
+    command: ["python", "-m", "order_payment.cli", "worker", "orders", "expire"]
+    environment: *orders-env
+    depends_on:
+      orders-migrate: {condition: service_completed_successfully}
+
+  payments-relay:
+    <<: *payment-worker
+    command: ["python", "-m", "order_payment.cli", "worker", "payments", "relay"]
+
+  payments-consumer:
+    <<: *payment-worker
+    command: ["python", "-m", "order_payment.cli", "worker", "payments", "consume"]
+
+  demo-seed:
+    <<: *catalog-image
+    command: ["python", "seed.py", "--with-stock"]
+    depends_on:
+      catalog: {condition: service_healthy}
+      order-api: {condition: service_healthy}
+
+  gateway:
+    build: ./services/gateway
+    restart: unless-stopped
+    environment:
+      CATALOG_URL: http://catalog:8001
+      ORDER_URL: http://order-api:8002
+      GATEWAY_TIMEOUT: ${GATEWAY_TIMEOUT:-6}
+      JWT_SECRET: ${JWT_SECRET:-semerochka-local-demo-signing-key-change-me}
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8000}:8000"
+    depends_on:
+      demo-seed: {condition: service_completed_successfully}
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]
+
+  frontend:
+    build: ./services/frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      gateway: {condition: service_healthy}
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  catalog-data:
+  orders-data:
+  payments-data:
+  rabbitmq-data:

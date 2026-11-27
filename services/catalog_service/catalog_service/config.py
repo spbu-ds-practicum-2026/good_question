@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # Order Service owns stock. Catalog only calls its idempotent initialization endpoint.
     order_service_url: str = "http://localhost:8002"
-    order_initial_stock_path: str = "/internal/stock/initial"
+    order_initial_stock_path: str = "/stock/{sku}/initial"
     order_timeout: float = Field(default=2.0, gt=0, le=30)
     order_retries: int = Field(default=1, ge=0, le=2)
 
