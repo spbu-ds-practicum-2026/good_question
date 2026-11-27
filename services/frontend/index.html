@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Магазин Семёрочка — каталог, корзина и заказы">
+  <title>Семёрочка — магазин у дома</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" data-view="catalog"><span class="brand-mark">7</span><span>Семёрочка<small>магазин у дома</small></span></a>
+    <nav class="main-nav" aria-label="Основная навигация">
+      <button class="nav-link active" data-view="catalog">Каталог</button>
+      <button class="nav-link" data-view="orders">Мои заказы</button>
+      <button class="nav-link" data-view="admin">Администратор</button>
+    </nav>
+    <div class="top-actions">
+      <button id="loginButton" class="button button-ghost">Войти</button>
+      <button class="button button-primary cart-open" data-view="cart">Корзина <span id="cartCount" class="count">0</span></button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="catalogView" class="view">
+      <div class="hero">
+        <div><p class="eyebrow">ПРОСТО ПОКУПАТЬ</p><h1>Всё нужное<br>рядом</h1><p>Выбирайте товары и забирайте заказ в удобное время.</p></div>
+        <div class="hero-art" aria-hidden="true"><span>7</span><i>свежее<br>каждый день</i></div>
+      </div>
+      <div class="section-heading"><div><p class="eyebrow">НАШ АССОРТИМЕНТ</p><h2>Каталог товаров</h2></div><span id="productTotal" class="muted"></span></div>
+      <div class="filters">
+        <label class="search-box"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="Найти товар..." autocomplete="off"></label>
+        <select id="categoryFilter" aria-label="Категория"><option value="">Все категории</option></select>
+        <div class="price-filter"><input id="minPrice" type="number" min="0" placeholder="Цена от"><span>—</span><input id="maxPrice" type="number" min="0" placeholder="Цена до"></div>
+        <button id="resetFilters" class="button button-ghost">Сбросить</button>
+      </div>
+      <div id="catalogMessage" class="notice hidden"></div>
+      <div id="productGrid" class="product-grid"></div>
+      <div class="pagination"><button id="prevPage" class="button button-ghost">Назад</button><span id="pageInfo">Страница 1</span><button id="nextPage" class="button button-ghost">Далее</button></div>
+    </section>
+
+    <section id="cartView" class="view hidden">
+      <div class="section-heading"><div><p class="eyebrow">ВАШ ВЫБОР</p><h1>Корзина</h1></div><button class="button button-ghost" data-view="catalog">← Продолжить покупки</button></div>
+      <div class="two-column"><div id="cartItems" class="panel"></div><aside class="panel summary"><h3>Ваш заказ</h3><div class="summary-row"><span>Товары</span><strong id="cartSubtotal">0 ₽</strong></div><div class="summary-row"><span>Получение</span><strong>Самовывоз</strong></div><div class="summary-total"><span>Итого</span><strong id="cartTotal">0 ₽</strong></div><button id="checkoutButton" class="button button-primary full">Оформить заказ</button><p class="muted tiny">Остаток и окончательная цена подтверждаются сервером при оформлении.</p></aside></div>
+    </section>
+
+    <section id="ordersView" class="view hidden">
+      <div class="section-heading"><div><p class="eyebrow">ПОКУПКИ</p><h1>Мои заказы</h1></div><button id="refreshOrders" class="button button-ghost">Обновить</button></div>
+      <div id="ordersList" class="stack"></div>
+    </section>
+
+    <section id="adminView" class="view hidden">
+      <div class="section-heading"><div><p class="eyebrow">УПРАВЛЕНИЕ МАГАЗИНОМ</p><h1>Администрирование</h1></div><span class="role-label">Только для администратора</span></div>
+      <div class="admin-grid">
+        <form id="productForm" class="panel form-panel">
+          <h3 id="productFormTitle">Добавить товар</h3>
+          <input type="hidden" id="editingSku">
+          <label>SKU<input id="adminSku" required maxlength="64" placeholder="APPLE-001"></label>
+          <label>Название<input id="adminName" required maxlength="160" placeholder="Яблоки сезонные"></label>
+          <label>Категория<input id="adminCategory" required maxlength="100" placeholder="Фрукты и овощи"></label>
+          <div class="form-row"><label>Цена, ₽<input id="adminPrice" type="number" required min="1" step="1"></label><label>Начальный остаток<input id="adminStock" type="number" required min="0" step="1" value="0"></label></div>
+          <div class="form-row"><button class="button button-primary" type="submit">Сохранить</button><button id="cancelEdit" class="button button-ghost" type="button">Очистить</button></div>
+        </form>
+        <div class="panel"><div class="panel-heading"><h3>Товары</h3><button id="refreshAdminProducts" class="button button-ghost">Обновить</button></div><div id="adminProducts" class="admin-products"></div></div>
+      </div>
+      <div class="panel admin-orders"><div class="panel-heading"><h3>Заказы покупателей</h3><button id="refreshAdminOrders" class="button button-ghost">Обновить</button></div><div id="adminOrders" class="stack"></div></div>
+    </section>
+  </main>
+
+  <dialog id="loginDialog" class="dialog">
+    <form method="dialog" id="loginForm">
+      <button class="dialog-close" value="cancel" aria-label="Закрыть">×</button>
+      <p class="eyebrow">ДЕМО-ДОСТУП</p><h2>Вход</h2>
+      <label>JWT-токен<textarea id="tokenInput" rows="4" placeholder="Вставьте выданный командой JWT"></textarea></label>
+      <label>Роль<select id="roleInput"><option value="user">Покупатель</option><option value="admin">Администратор</option></select></label>
+      <button id="saveLogin" class="button button-primary full" value="default">Сохранить</button>
+      <p class="muted tiny">В учебной демоверсии токен вводится вручную. В production авторизация должна выполняться через согласованный механизм Gateway.</p>
+    </form>
+  </dialog>
+
+  <dialog id="checkoutDialog" class="dialog">
+    <form method="dialog" id="checkoutForm">
+      <button class="dialog-close" value="cancel" aria-label="Закрыть">×</button>
+      <p class="eyebrow">ПОСЛЕДНИЙ ШАГ</p><h2>Оформление заказа</h2>
+      <label>Имя получателя<input id="customerName" required placeholder="Как к вам обращаться"></label>
+      <label>Место самовывоза<input id="pickupPoint" required placeholder="Например, ул. Ленина, 10"></label>
+      <p class="muted tiny">Резерв товара создаётся сервером на 15 минут. Не нажимайте «Оформить» повторно при ожидании ответа.</p>
+      <button id="confirmCheckout" class="button button-primary full" value="default">Подтвердить заказ</button>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <footer><span>Семёрочка</span><span>Учебный проект · Демоверсия</span></footer>
+  <script src="./app.js"></script>
+</body>
+</html>
