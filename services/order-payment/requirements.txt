@@ -1,0 +1,15 @@
+# Python 3.12+
+# Библиотеки для запуска Order Service и Payment Mock.
+# Ограничения версий совпадают с runtime-зависимостями pyproject.toml.
+
+fastapi>=0.115,<1          # HTTP API и валидация запросов
+uvicorn>=0.34,<1          # Обязателен для запуска Order API и Payment API
+sqlalchemy>=2.0.38,<3     # Работа с моделями и транзакциями БД
+psycopg[binary]>=3.2,<4    # Драйвер PostgreSQL
+httpx>=0.28,<1            # REST-запросы к Catalog Service
+pika>=1.3,<2              # Публикация и получение сообщений RabbitMQ
+pydantic-settings>=2.8,<3 # Загрузка конфигурации из окружения и .env
+
+# Для тестирования дополнительно нужны pytest и Ruff:
+# pip install -e './services/order-payment[test]' (из корня репозитория).
+# PostgreSQL и RabbitMQ — внешние сервисы, а не Python-библиотеки.
